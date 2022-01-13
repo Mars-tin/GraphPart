@@ -11,7 +11,6 @@ See `setup.sh`.
 ## Run the Code
 
 ```bash
-python main.py --baseline far-partition-prop --dataset citeseer
+python main.py --baselines graphpart --model gcn --dataset cora --seed 0
 ```
-
 

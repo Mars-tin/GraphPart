@@ -3,175 +3,222 @@ from __future__ import print_function
 
 import argparse
 import random
+from timeit import default_timer as timer
 
-from models import GCN, GAT
+from models import GCN, GAT, SAGE
 from query import *
 from dataset import load_data
 
 
-# Training settings
-parser = argparse.ArgumentParser()
+def run(args):
 
-# General configs
-parser.add_argument(
-    "--retrain", type=bool, default=True)
-parser.add_argument(
-    "--baseline", type=str, default='random')
-parser.add_argument(
-    "--dataset", default='cora')
-parser.add_argument(
-    "--model", default="gcn")
+    # Load dataset
+    data = load_data(name=args.dataset,
+                     partition=args.partition,
+                     read=True, save=False).to(args.device)
 
-# Training parameters
-parser.add_argument(
-    "--init", type=float, default=5, help="Number of initially labelled nodes.")
-parser.add_argument(
-    "--budget", type=list, default=[25, 30, 35, 40, 45, 55, 65, 75, 85, 95, 115, 135, 155, 175, 195],
-    help="Number of rounds to run the agent.")
-parser.add_argument(
-    "--rounds", type=int, default=1, help="Number of rounds to run the agent.")
-parser.add_argument(
-    "--num_centers", type=int, default=2, help="Default number of centers per partition.")
-parser.add_argument(
-    "--epochs", type=int, default=300, help="Number of epochs to train.")
-parser.add_argument(
-    "--seed", type=int, default=10, help="Number of random seeds.")
-parser.add_argument(
-    "--verbose", type=int, default=0, help="Verbose.")
-parser.add_argument(
-    "--device", default=torch.device("cuda" if torch.cuda.is_available() else "cpu"))
+    for gnn in args.model:
+        for baseline in args.baselines:
+            for budget in args.budget:
+                budget = int(budget)
+                seed = int(args.seed)
 
-# Common hyper-parameters
-parser.add_argument(
-    "--lr", type=float, default=0.01, help="Initial learning rate.")
-parser.add_argument(
-    "--weight_decay", type=float, default=5e-4,
-    help="Weight decay (L2 loss on parameters).")
-parser.add_argument(
-    "--hidden", type=int, default=16, help="Number of hidden units.")
-parser.add_argument(
-    "--dropout", type=float, default=0,
-    help="Dropout rate (1 - keep probability).")
-parser.add_argument(
-    "--activation", default="relu")
+                # Set seeds
+                if args.verbose == 1:
+                    print('Seed {:03d}:'.format(seed))
+                random.seed(seed)
+                np.random.seed(seed)
+                torch.manual_seed(seed)
+                if torch.cuda.is_available():
+                    torch.cuda.manual_seed(seed)
 
-# GAT hyper-parameters
-parser.add_argument(
-    "--num_heads", type=int, default=4, help="Number of heads.")
+                # Choose model
+                model_args = {
+                    "in_channels": data.num_features,
+                    "out_channels": data.num_classes,
+                    "hidden_channels": args.hidden,
+                    "num_layers": args.num_layers,
+                    "dropout": args.dropout,
+                    "activation": args.activation,
+                    "batchnorm": args.batchnorm
+                }
 
-args, _ = parser.parse_known_args()
+                # Initialize models
+                if gnn == "gat":
+                    model_args["num_heads"] = args.num_heads
+                    model_args["hidden_channels"] = int(args.hidden / args.num_heads)
+                    model = GAT(**model_args)
+                elif gnn == "gcn":
+                    model = GCN(**model_args)
+                elif gnn == "sage":
+                    model = SAGE(**model_args)
+                else:
+                    raise NotImplemented
 
-# Load dataset
-data = load_data(name=args.dataset).to(args.device)
+                model = model.to(args.device)
 
-# Choose model
-model_args = {
-    "num_features": data.num_features,
-    "num_classes": data.num_classes,
-    "hidden_size": args.hidden,
-    "dropout": args.dropout,
-    "activation": args.activation
-}
+                # General-Purpose Methods
+                if baseline == "random":
+                    agent = Random(data, model, seed, args)
+                elif baseline == "density":
+                    agent = Density(data, model, seed, args)
+                elif baseline == "uncertainty":
+                    agent = Uncertainty(data, model, seed, args)
+                elif baseline == "coreset":
+                    agent = CoreSetGreedy(data, model, seed, args)
 
-# Set seeds
-for budget in args.budget:
-    budget = int(budget)
-    for seed in range(args.seed):
-        if args.verbose == 1:
-            print('Seed {:03d}:'.format(seed))
-        random.seed(seed)
-        np.random.seed(seed)
-        torch.manual_seed(seed)
-        if torch.cuda.is_available():
-            torch.cuda.manual_seed(seed)
+                # Graph-specific Methods
+                elif baseline == "degree":
+                    agent = Degree(data, model, seed, args)
+                elif baseline == "pagerank":
+                    agent = PageRank(data, model, seed, args)
+                elif baseline == "age":
+                    agent = AGE(data, model, seed, args)
+                elif baseline == "featprop":
+                    agent = ClusterBased(data, model, seed, args,
+                                         representation='aggregation',
+                                         encoder='gcn')
 
-        if args.model == "gat":
-            model_args["num_heads"] = args.num_heads
-            model_args["hidden_size"] = int(args.hidden / args.num_heads)
-            model = GAT(**model_args)
-        else:
-            model = GCN(**model_args)
+                # Our Methods
+                elif baseline == "graphpart":
+                    agent = PartitionBased(data, model, seed, args,
+                                           representation='aggregation',
+                                           encoder='gcn',
+                                           compensation=0)
+                elif baseline == "graphpartfar":
+                    agent = PartitionBased(data, model, seed, args,
+                                           representation='aggregation',
+                                           encoder='gcn',
+                                           compensation=1)
 
-        model = model.to(args.device)
+                # Ablation Studies
+                elif 'part' in baseline:
+                    agent = PartitionBased(data, model, seed, args,
+                                           representation=args.representation,
+                                           compensation=0)
+                else:
+                    agent = ClusterBased(data, model, seed, args,
+                                         representation=args.representation)
 
-        # Choose agent
-        # Naive Methods
-        if args.baseline == "random":
-            agent = RandomSampling(data, model, seed, args)
-        elif args.baseline == "degree":
-            agent = MaximumDegree(data, model, seed, args)
-        elif args.baseline == "entropy":
-            agent = MaximumEntropy(data, model, seed, args)
-        elif args.baseline == "density":
-            agent = MaximumDensity(data, model, seed, args)
-        elif args.baseline == "centrality":
-            agent = MaximumCentrality(data, model, seed, args)
-        elif args.baseline == "rwcs":
-            agent = RWCS(data, model, seed, args)
+                # Initialization
+                training_mask = np.zeros(data.num_nodes, dtype=bool)
+                initial_mask = np.arange(data.num_nodes)
+                np.random.shuffle(initial_mask)
+                init = args.init
+                if baseline in ['density', 'uncertainty', 'coreset', 'age']:
+                    init = budget // 3
+                training_mask[initial_mask[:init]] = True
 
-        # Coreset
-        elif args.baseline == "coreset":
-            agent = CoreSetGreedy(data, model, seed, args)
+                training_mask = torch.tensor(training_mask)
+                agent.update(training_mask)
+                agent.train()
 
-        # Combined Methods
-        elif args.baseline == "age":
-            agent = AGE(data, model, seed, args)
+                if args.verbose > 0:
+                    print('Round {:03d}: Labelled: {:d}, Prediction macro-f1 score {:.4f}'
+                          .format(0, init, agent.evaluate()))
 
-        # Ablation Study
-        elif args.baseline == "kmeans":
-            agent = KmeansNaive(data, model, seed, args)
-        elif args.baseline == "kmeans-embed":
-            agent = KmeansEmbed(data, model, seed, args)
-        elif args.baseline == "feature-propagation":
-            agent = FeaturePropagation(data, model, seed, args)
+                # Experiment
+                for rd in range(1, args.rounds + 1):
+                
+                    # Query
+                    start = timer()
+                    indices = agent.query(budget - init)
+                    end = timer()
+                    print('Total Query Runtime [s]:', end - start)
 
-        elif args.baseline == "graph-partition":
-            agent = GraphPartition(data, model, seed, args)
-        elif args.baseline == "graph-partition-embed":
-            agent = GraphPartitionEmbed(data, model, seed, args)
-        elif args.baseline == "graph-partition-prop":
-            agent = GraphPartitionProp(data, model, seed, args)
+                    # Update
+                    training_mask[indices] = True
+                    agent.update(training_mask)
 
-        # Far
-        elif args.baseline == "far-partition-prop":
-            agent = FarPartitionProp(data, model, seed, args)
-        else:
-            agent = None
-            exit(-1)
+                    # Training
+                    agent.train()
 
-        # Initialization
-        training_mask = np.zeros(data.num_nodes, dtype=bool)
-        initial_mask = np.arange(data.num_nodes)
-        np.random.shuffle(initial_mask)
-        training_mask[initial_mask[:args.init]] = True
+                    # Evaluate
+                    f1, acc = agent.evaluate()
+                    labelled = len(np.where(agent.data.train_mask != 0)[0])
 
-        training_mask = torch.tensor(training_mask)
-        agent.update(training_mask)
-        agent.train()
+                    if args.verbose > 0:
+                        print('Round {:03d}: # Labelled nodes: {:d}, Prediction macro-f1 score {:.4f}'
+                              .format(rd, labelled, f1))
+                    else:
+                        print("{},{},{},{},{},{},{}"
+                              .format(gnn, baseline,
+                                      args.dataset, seed,
+                                      labelled, f1, acc))
 
-        if args.verbose > 0:
-            print('Round {:03d}: Labelled: {:d}, Prediction macro-f1 score {:.4f}'
-                  .format(0, args.init, agent.predict()))
 
-        # Experiment
-        for rd in range(1, args.rounds+1):
-            # query
-            indices = agent.query(budget)
-            training_mask[indices] = True
+if __name__ == '__main__':
 
-            # update
-            agent.update(training_mask)
-            agent.train()
+    datasets = ['cora']
+    gnns = ['gcn', 'sage', 'gat']
+    budgets = [20, 40, 80]
+    baselines = ['graphpart', 'graphpartfar']
 
-            # predict
-            f1 = agent.predict()
-            labelled = len(np.where(agent.data.train_mask != 0)[0])
+    # Training settings
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--verbose", type=int, default=0, help="Verbose: 0, 1 or 2")
+    parser.add_argument(
+        "--device", default=torch.device("cuda" if torch.cuda.is_available() else "cpu"))
 
-            if args.verbose > 0:
-                print('Round {:03d}: # Labelled nodes: {:d}, Prediction macro-f1 score {:.4f}'
-                      .format(rd, labelled, f1))
-            else:
-                print("{},{},{},{},{},{}"
-                      .format(args.model, args.baseline,
-                              args.dataset, seed,
-                              labelled, f1))
+    # General configs
+    parser.add_argument(
+        "--baselines", type=list, default=baselines)
+    parser.add_argument(
+        "--model", default=gnns)
+    parser.add_argument(
+        "--dataset", default='cora')
+    parser.add_argument(
+        "--partition", type=str, default='greedy')
+
+    # Active Learning parameters
+    parser.add_argument(
+        "--budget", type=list, default=budgets,
+        help="Number of rounds to run the agent.")
+    parser.add_argument(
+        "--retrain", type=bool, default=True)
+    parser.add_argument(
+        "--num_centers", type=int, default=1)
+    parser.add_argument(
+        "--representation", type=str, default='features')
+    parser.add_argument(
+        "--compensation", type=float, default=1.0)
+    parser.add_argument(
+        "--init", type=float, default=0, help="Number of initially labelled nodes.")
+    parser.add_argument(
+        "--rounds", type=int, default=1, help="Number of rounds to run the agent.")
+    parser.add_argument(
+        "--epochs", type=int, default=300, help="Number of epochs to train.")
+    parser.add_argument(
+        "--steps", type=int, default=4, help="Number of steps of random walk.")
+
+    # GNN parameters
+    parser.add_argument(
+        "--seed", type=int, default=0, help="Number of random seeds.")
+    parser.add_argument(
+        "--lr", type=float, default=0.01, help="Initial learning rate.")
+    parser.add_argument(
+        "--weight_decay", type=float, default=5e-4,
+        help="Weight decay (L2 loss on parameters).")
+    parser.add_argument(
+        "--hidden", type=int, default=16, help="Number of hidden units.")
+    parser.add_argument(
+        "--num_layers", type=int, default=2, help="Number of layers.")
+    parser.add_argument(
+        "--dropout", type=float, default=0,
+        help="Dropout rate (1 - keep probability).")
+    parser.add_argument(
+        "--batchnorm", type=bool, default=False,
+        help="Perform batch normalization")
+    parser.add_argument(
+        "--activation", default="relu")
+
+    # GAT hyper-parameters
+    parser.add_argument(
+        "--num_heads", type=int, default=8, help="Number of heads.")
+
+    args, _ = parser.parse_known_args()
+
+    for dataset in datasets:
+        args.dataset = dataset
+        run(args)

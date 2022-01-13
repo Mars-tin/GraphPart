@@ -1,9 +1,10 @@
 import numpy as np
 from copy import deepcopy
+from timeit import default_timer as timer
 
 import sklearn.metrics as metrics
-from sklearn.cluster import KMeans
-from sklearn_extra.cluster import KMedoids
+
+import dgl
 
 import networkx as nx
 from networkx.algorithms.link_analysis.pagerank_alg import pagerank
@@ -12,10 +13,19 @@ import torch
 import torch.nn.functional as F
 import torch.optim as optim
 
+from torch_geometric.nn import GCNConv, SAGEConv
+from torch_geometric.utils.convert import to_scipy_sparse_matrix
 
-class ActiveLearningAgent:
+from models import Cluster
+
+
+class ActiveLearning:
     """
-    Base class.
+    An active learning framework that...
+    * queries from an oracle;
+    * updates its known set,
+    * trains the GNN model, and
+    * evaluate the Macro F-1 score.
     """
 
     def __init__(self, data, model, seed, args):
@@ -26,7 +36,7 @@ class ActiveLearningAgent:
         self.args = args
         self.retrain = args.retrain
         self.clf = None
-        self.x_prop = None
+        self.aggregated = None
         self.num_centers = args.num_centers
         self.num_parts = -1
 
@@ -48,53 +58,99 @@ class ActiveLearningAgent:
         for epoch in range(self.args.epochs):
             self.clf.train()
             optimizer.zero_grad()
+            out = self.clf(self.data.x, self.data.adj_t)
+            true = self.data.y
+            if len(true.shape) > 1:
+                true = true.squeeze(1)
             loss = F.cross_entropy(
-                self.clf(self.data.x, self.data.edge_index)[self.data.train_mask],
-                self.data.y[self.data.train_mask])
+                out[self.data.train_mask],
+                true[self.data.train_mask])
             if self.args.verbose == 2:
                 print('Epoch {:03d}: Training loss: {:.4f}'.format(epoch, loss))
             loss.backward()
             optimizer.step()
 
-    def predict(self):
+    def evaluate(self):
         self.clf.eval()
-        logits = self.clf(self.data.x, self.data.edge_index)
+        logits = self.clf(self.data.x, self.data.adj_t)
         y_pred = logits.max(1)[1].cpu()
         y_true = self.data.y.cpu()
         f1 = metrics.f1_score(y_true, y_pred, average='macro')
+        acc = metrics.f1_score(y_true, y_pred, average='micro')
         if self.args.verbose == 2:
             print('Macro-f1 score: {:.4f}'.format(f1))
-        return f1
+            print('Micro-f1 score: {:.4f}'.format(acc))
+        return f1, acc
 
-    def transform(self, method='prop'):
+    def get_node_representation(self, rep='aggregation', encoder='gcn'):
 
-        if method == 'prop':
-            if self.clf.num_layers > 2:
-                if self.x_prop is None:
-                    A = self.data.adj + torch.eye(self.data.adj.shape[0], device=self.args.device)  # A + I
-                    D = torch.diag(A.sum(dim=0) ** (-1 / 2))  # (D + I)^(-1/2)
-                    A_norm = torch.sparse.mm(torch.sparse.mm(D, A), D)
-                    self.x_prop = A_norm
-                    for i in range(self.clf.num_layers - 1):
-                        self.x_prop = torch.sparse.mm(self.x_prop, A_norm)
-                    self.x_prop = torch.sparse.mm(self.x_prop, self.data.x)
-                return self.x_prop
-            return self.data.x_prop
+        if rep == 'aggregation':
+            if self.aggregated is None:
 
-        elif method == 'embed':
+                # Dense Implementation
+
+                # A_ = self.data.adj_t.to_dense() + torch.eye(self.data.num_nodes, device=self.args.device)  # A + I
+                # D_ = torch.diag(A_.sum(dim=0) ** (-1 / 2))  # (A + I)^(-1/2)
+                # A_norm = torch.sparse.mm(torch.sparse.mm(D_, A_), D_)
+                # self.aggregated = A_norm
+                # for i in range(self.clf.num_layers - 1):
+                #     self.aggregated = torch.sparse.mm(self.aggregated, A_norm)
+                # self.aggregated = torch.sparse.mm(self.aggregated, self.data.x)
+
+                # Sparse Implementation
+
+                # nnz = len(self.data.adj_t.storage._row)
+                # indice = torch.cat([self.data.adj_t.storage._row.unsqueeze(dim=0),
+                #                     self.data.adj_t.storage._col.unsqueeze(dim=0)], dim=0)
+                # values = torch.ones(nnz, device=self.args.device)
+                # A = torch.sparse_coo_tensor(indice, values, [self.data.num_nodes, self.data.num_nodes])
+                # diag = torch.tensor(range(self.data.num_nodes), device=self.args.device).unsqueeze(dim=0)
+                # indice = torch.cat([diag, diag], dim=0)
+                # values = torch.ones(self.data.num_nodes, device=self.args.device)
+                # I = torch.sparse_coo_tensor(indice, values, [self.data.num_nodes, self.data.num_nodes])
+                # A = A + I
+                # value = torch.sparse.sum(A, dim=0) ** (-1 / 2)
+                # D = torch.sparse_coo_tensor(indice, value.to_dense(), [self.data.num_nodes, self.data.num_nodes])
+                # A_norm = torch.sparse.mm(torch.sparse.mm(D, A), D)
+                # self.aggregated = self.data.x.to_sparse()
+                # for i in range(self.clf.num_layers):
+                #     self.aggregated = torch.sparse.mm(A_norm, self.aggregated)
+                # self.aggregated = self.aggregated.to_dense()
+
+                feat_dim = self.data.x.size(1)
+                if encoder == 'sage':
+                    conv = SAGEConv(feat_dim, feat_dim, bias=False)
+                    conv.lin_l.weight = torch.nn.Parameter(torch.eye(feat_dim))
+                    conv.lin_r.weight = torch.nn.Parameter(torch.eye(feat_dim))
+                else:
+                    conv = GCNConv(feat_dim, feat_dim, cached=True, bias=False)
+                    conv.lin.weight = torch.nn.Parameter(torch.eye(feat_dim))
+                conv.to(self.args.device)
+                with torch.no_grad():
+                    self.aggregated = conv(self.data.x, self.data.adj_t)
+                    self.aggregated = conv(self.aggregated, self.data.adj_t)
+            return self.aggregated
+
+        elif rep == 'embedding':
             with torch.no_grad():
-                embed = self.clf.encode(self.data.x, self.data.edge_index)
+                embed = self.clf.embed(self.data.x, self.data.adj_t)
             return embed
 
         else:
             return self.data.x
 
-    def get_n_cluster(self, b, partitions, x_embed=None, method='default'):
+    def split_cluster(self, b, partitions, x_embed=None, method='default'):
 
-        if method == 'size':
+        if method == 'inertia':
             part_size = []
             for i in range(self.num_parts):
-                part_size.append(len(np.where(partitions == i)[0]))
+                part_id = np.where(partitions == i)[0]
+                x = x_embed[part_id]
+                kmeans = Cluster(n_clusters=1, n_dim=x_embed.shape[1], seed=self.seed, device=self.args.device)
+                kmeans.train(x.cpu())
+                inertia = kmeans.get_inertia()
+                part_size.append(inertia)
+
             part_size = np.rint(b * np.array(part_size) / sum(part_size)).astype(int)
             part_size = np.maximum(self.num_centers, part_size)
             i = 0
@@ -110,16 +166,10 @@ class ActiveLearningAgent:
                     part_size[i] += 1
                     i += 1
 
-        elif method == 'inertia':
+        elif method == 'size':
             part_size = []
             for i in range(self.num_parts):
-                part_id = np.where(partitions == i)[0]
-                x = x_embed[part_id]
-                kmeans = KMeans(n_clusters=1, init='k-means++')
-                kmeans.fit(x.cpu())
-                inertia = kmeans.inertia_
-                part_size.append(inertia)
-
+                part_size.append(len(np.where(partitions == i)[0]))
             part_size = np.rint(b * np.array(part_size) / sum(part_size)).astype(int)
             part_size = np.maximum(self.num_centers, part_size)
             i = 0
@@ -142,14 +192,19 @@ class ActiveLearningAgent:
 
         return part_size
 
+    def __str__(self):
+        return "Active Learning Agent (uninitialized)"
 
-class RandomSampling(ActiveLearningAgent):
+
+class Random(ActiveLearning):
     """
-    Choose b random nodes.
+    Random:
+    The Random Sampling method chooses nodes uniformly at random,
+    similarly as the commonly used semi-supervised learning experiment setting for GCN.
     """
 
     def __init__(self, data, model, seed, args):
-        super(RandomSampling, self).__init__(data, model, seed, args)
+        super(Random, self).__init__(data, model, seed, args)
 
     def query(self, b):
         indice = np.random.choice(
@@ -157,135 +212,70 @@ class RandomSampling(ActiveLearningAgent):
         )
         return torch.tensor(indice)
 
+    def __str__(self):
+        return "Random"
 
-class MaximumDegree(ActiveLearningAgent):
+
+class Density(ActiveLearning):
     """
-    Choose b nodes with maximum degrees.
+    Density:
+    The Density method first performs a clustering algorithm on the hidden representations of the nodes,
+    and then chooses nodes with maximum density score, which is (approximately) inversely proportional to
+    the L2-distance between each node and its cluster center.
     """
 
     def __init__(self, data, model, seed, args):
-        super(MaximumDegree, self).__init__(data, model, seed, args)
+        super(Density, self).__init__(data, model, seed, args)
 
     def query(self, b):
-        degree = self.data.adj.sum(dim=0)
-        # degree = self.data.adj.cpu().sum(dim=0)
-        degree[np.where(self.data.train_mask != 0)[0]] = 0
-        _, indices = torch.topk(degree, k=b)
+        # Get propagated nodes
+        x_embed = self.get_node_representation('embedding').cpu()
+
+        # Perform K-Means as approximation
+        kmeans = Cluster(n_clusters=b, n_dim=x_embed.shape[1], seed=self.seed, device=self.args.device)
+        kmeans.train(x_embed)
+
+        # Calculate density
+        centers = kmeans.get_centroids()
+        label = kmeans.predict(x_embed)
+        centers = centers[label]
+        dist_map = torch.linalg.norm(x_embed - centers, dim=1)
+        density = 1 / (1 + dist_map)
+
+        density[np.where(self.data.train_mask != 0)[0]] = 0
+        _, indices = torch.topk(density, k=b)
+
         return indices
 
+    def __str__(self):
+        return "Density"
 
-class MaximumEntropy(ActiveLearningAgent):
+
+class Uncertainty(ActiveLearning):
     """
-    Choose b nodes with maximum entropy.
+    Uncertainty:
+    The Uncertainty method chooses the nodes with maximum entropy on the predicted class distribution.
     """
 
     def __init__(self, data, model, seed, args):
-        super(MaximumEntropy, self).__init__(data, model, seed, args)
+        super(Uncertainty, self).__init__(data, model, seed, args)
 
     def query(self, b):
-        logits = self.clf(self.data.x, self.data.edge_index)
+        logits = self.clf(self.data.x, self.data.adj_t)
         entropy = -torch.sum(F.softmax(logits, dim=1) * F.log_softmax(logits, dim=1), dim=1)
         entropy[np.where(self.data.train_mask != 0)[0]] = 0
         _, indices = torch.topk(entropy, k=b)
         return indices
 
+    def __str__(self):
+        return "Uncertainty"
 
-class MaximumDensity(ActiveLearningAgent):
+
+class CoreSetGreedy(ActiveLearning):
     """
-    Choose b nodes with maximum density.
-    K-Means clustering over the last hidden representation.
-    """
-
-    def __init__(self, data, model, seed, args):
-        super(MaximumDensity, self).__init__(data, model, seed, args)
-
-    def query(self, b):
-        # Get propagated nodes
-        x_embed = self.transform('embed').cpu()
-
-        # Perform K-Means as approximation
-        kmeans = KMeans(n_clusters=b, init='k-means++')
-        kmeans.fit(x_embed)
-
-        # Calculate density
-        centers = kmeans.cluster_centers_
-        label = kmeans.predict(x_embed)
-        centers = centers[label]
-        dist_map = np.linalg.norm(x_embed - centers, axis=1)
-        density = 1 / (1 + dist_map)
-
-        density[np.where(self.data.train_mask != 0)[0]] = 0
-        _, indices = torch.topk(torch.tensor(density), k=b)
-
-        return indices
-
-
-class MaximumCentrality(ActiveLearningAgent):
-    """
-    Choose b nodes with maximum Pagerank score.
-    """
-
-    def __init__(self, data, model, seed, args):
-        super(MaximumCentrality, self).__init__(data, model, seed, args)
-
-    def query(self, b):
-        nxg = nx.Graph(self.data.g.to_networkx())
-        page = torch.tensor(list(pagerank(nxg).values()))
-        page[np.where(self.data.train_mask != 0)[0]] = 0
-        _, indices = torch.topk(page, k=b)
-        return indices
-
-
-class AGE(ActiveLearningAgent):
-    """
-    Selects nodes which maximizes a linear combination of three metrics:
-    PageRank, uncertainty and density.
-    """
-
-    def __init__(self, data, model, seed, args):
-        super(AGE, self).__init__(data, model, seed, args)
-
-    def query(self, b):
-        # Get density
-        x_embed = self.transform('embed').cpu()
-        N = x_embed.shape[0]
-
-        kmeans = KMeans(n_clusters=b, init='k-means++')
-        kmeans.fit(x_embed)
-        centers = kmeans.cluster_centers_
-        label = kmeans.predict(x_embed)
-        centers = centers[label]
-        dist_map = np.linalg.norm(x_embed - centers, axis=1)
-        density = torch.tensor(1 / (1 + dist_map), dtype=torch.float32, device=self.args.device)
-
-        # Get entropy
-        logits = self.clf(self.data.x, self.data.edge_index)
-        entropy = -torch.sum(F.softmax(logits, dim=1) * F.log_softmax(logits, dim=1), dim=1)
-
-        # Get centrality
-        nxg = nx.Graph(self.data.g.to_networkx())
-        page = torch.tensor(list(pagerank(nxg).values()), dtype=torch.float32, device=self.args.device)
-
-        # Get percentile
-        percentile = (torch.arange(N, dtype=torch.float32, device=self.args.device) / N)
-        id_sorted = density.argsort(descending=False)
-        density[id_sorted] = percentile
-        id_sorted = entropy.argsort(descending=False)
-        entropy[id_sorted] = percentile
-        id_sorted = page.argsort(descending=False)
-        page[id_sorted] = percentile
-
-        # Get linear combination
-        alpha, beta, gamma = self.data.params['age']
-        age_score = alpha * entropy + beta * density + gamma * page
-        age_score[np.where(self.data.train_mask != 0)[0]] = 0
-        _, indices = torch.topk(age_score, k=b)
-        return indices
-
-
-class CoreSetGreedy(ActiveLearningAgent):
-    """
-    K-Center clustering over the last hidden representation and return centers.
+    CoreSet:
+    The CoreSet method performs a K-Center clustering over the hidden representations of nodes.
+    A time-efficient greedy approximation version by choosing node closest to the cluster centers.
     """
 
     def __init__(self, data, model, seed, args):
@@ -293,7 +283,7 @@ class CoreSetGreedy(ActiveLearningAgent):
 
     def query(self, b):
 
-        embed = self.transform('embed').cpu()
+        embed = self.get_node_representation('embedding').cpu()
         indices = list(np.where(self.data.train_mask != 0)[0])
 
         for i in range(b):
@@ -303,11 +293,15 @@ class CoreSetGreedy(ActiveLearningAgent):
             indices.append(int(new_index))
         return indices
 
+    def __str__(self):
+        return "Core Set (Greedy)"
 
-class CoreSetMIP(ActiveLearningAgent):
+
+class CoreSetMIP(ActiveLearning):
     """
-    K-Center clustering over the last hidden representation and return centers.
-    Optimized by MIP.
+    CoreSet:
+    The CoreSet method performs a K-Center clustering over the hidden representations of nodes.
+    Optimized by gurobipy MIP.
     """
 
     def __init__(self, data, model, seed, args):
@@ -317,7 +311,7 @@ class CoreSetMIP(ActiveLearningAgent):
         import gurobipy
 
         # Get distance matrix
-        embed = self.transform('embed')
+        embed = self.get_node_representation('embedding')
         dist_mat = embed.matmul(embed.t())
         sq = dist_mat.diagonal().reshape(self.data.num_nodes, 1)
         dist_mat = torch.sqrt(-dist_mat * 2 + sq + sq.t())
@@ -444,532 +438,223 @@ class CoreSetMIP(ActiveLearningAgent):
         else:
             return None
 
+    def __str__(self):
+        return "Core Set (MIP)"
 
-class KmeansNaive(ActiveLearningAgent):
+
+class Degree(ActiveLearning):
     """
-    K-Means clustering over the feature and return centers.
-
-    Feature Space: x
-    Partition: No
-    Avoid Known: No
-    """
-
-    def __init__(self, data, model, seed, args):
-        super(KmeansNaive, self).__init__(data, model, seed, args)
-
-    def query(self, b):
-        # Get propagated nodes
-        x_prop = self.transform('none')
-
-        # Perform K-Means as approximation
-        kmeans = KMeans(n_clusters=b, init='k-means++')
-        kmeans.fit(x_prop.cpu())
-        centers = kmeans.cluster_centers_
-
-        indices = list(np.where(self.data.train_mask != 0)[0])
-        for center in centers:
-            dist_map = np.linalg.norm(x_prop.cpu() - center, axis=1)
-            dist_map[indices] = np.infty
-            idx = np.argmin(dist_map)
-            indices.append(idx)
-        return torch.tensor(indices)
-
-
-class KmeansEmbed(ActiveLearningAgent):
-    """
-    K-Means clustering over the last hidden representation and return centers.
-
-    Feature Space: embedding
-    Partition: No
-    Avoid Known: No
+    Centrality:
+    The Centrality method chooses nodes with the largest graph centrality metric value.
+    This framework chooses node degree as the metric.
     """
 
     def __init__(self, data, model, seed, args):
-        super(KmeansEmbed, self).__init__(data, model, seed, args)
+        super(Degree, self).__init__(data, model, seed, args)
 
     def query(self, b):
-        # Get propagated nodes
-        x_prop = self.transform('embed')
 
-        # Perform K-Means as approximation
-        kmeans = KMeans(n_clusters=b, init='k-means++')
-        kmeans.fit(x_prop.cpu())
-        centers = kmeans.cluster_centers_
+        if hasattr(self.data.adj_t.storage, '_row'):
+            degree = self.data.adj_t.sum(dim=0)
+        else:
+            indice = torch.cat([self.data.adj_t[0].unsqueeze(dim=0),
+                                self.data.adj_t[1].unsqueeze(dim=0)], dim=0)
+            values = torch.ones(self.data.adj_t.shape[1], device=self.args.device)
+            adj = torch.sparse_coo_tensor(indice, values, [self.data.num_nodes, self.data.num_nodes]).to_dense()
+            degree = adj.sum(dim=0)
 
-        indices = list(np.where(self.data.train_mask != 0)[0])
-        for center in centers:
-            dist_map = np.linalg.norm(x_prop.cpu() - center, axis=1)
-            dist_map[indices] = np.infty
-            idx = np.argmin(dist_map)
-            indices.append(idx)
-        return torch.tensor(indices)
+        degree[np.where(self.data.train_mask != 0)[0]] = 0
+        _, indices = torch.topk(degree, k=b)
+        return indices
+
+    def __str__(self):
+        return "Centrality (Degree)"
 
 
-class FeaturePropagation(ActiveLearningAgent):
+class PageRank(ActiveLearning):
     """
-    K-Means (approximation for K-Medoids) clustering
-    over the propagated features and return centers.
-
-    Feature Space: prop
-    Partition: No
-    Avoid Known: No
+    PageRank:
+    The Centrality method chooses nodes with the largest graph centrality metric value.
+    This framework chooses node degree as the metric.
     """
 
     def __init__(self, data, model, seed, args):
-        super(FeaturePropagation, self).__init__(data, model, seed, args)
+        super(PageRank, self).__init__(data, model, seed, args)
 
     def query(self, b):
+        page = torch.tensor(list(pagerank(self.data.g).values()))
+        page[np.where(self.data.train_mask != 0)[0]] = 0
+        _, indices = torch.topk(page, k=b)
+        return indices
 
-        # Get propagated nodes
-        x_prop = self.transform('prop')
-
-        # Perform K-Means as approximation
-        kmeans = KMeans(n_clusters=b, init='k-means++')
-        kmeans.fit(x_prop.cpu())
-        centers = kmeans.cluster_centers_
-
-        indices = list(np.where(self.data.train_mask != 0)[0])
-        for center in centers:
-            dist_map = np.linalg.norm(x_prop.cpu() - center, axis=1)
-            dist_map[indices] = np.infty
-            idx = np.argmin(dist_map)
-            indices.append(idx)
-        return torch.tensor(indices)
+    def __str__(self):
+        return "Centrality (PageRank)"
 
 
-class GraphPartition(ActiveLearningAgent):
+class AGE(ActiveLearning):
     """
-    K-Means clustering over the feature over each graph partition.
-
-    Feature Space: x
-    Partition: Yes
-    Avoid Known: No
+    AGE:
+    AGE defines the informativeness of nodes by linearly combining three metrics:
+    centrality, density and uncertainty.
+    It further chooses nodes with the highest scores.
     """
 
     def __init__(self, data, model, seed, args):
-        super(GraphPartition, self).__init__(data, model, seed, args)
+        super(AGE, self).__init__(data, model, seed, args)
 
     def query(self, b):
 
-        # Perform graph partition
-        self.num_parts = int(np.ceil(b / self.num_centers))
-        if self.num_parts > self.data.max_part:
-            self.num_parts = self.data.max_part
-            self.num_centers = 1
-        partitions = np.array(self.data.partitions[self.num_parts].cpu())
-
-        # Determine the number of partitions and number of centers
-        part_size = self.get_n_cluster(b, partitions)
-
-        # Get propagated nodes
-        x_embed = self.transform('none')
-
-        # Perform K-Means as approximation
-        indices = list(np.where(self.data.train_mask != 0)[0])
-        for i in range(self.num_parts):
-            part_id = np.where(partitions == i)[0]
-            masked_id = [i for i, x in enumerate(part_id) if x in indices]
-            x = x_embed[part_id]
-
-            n_clusters = part_size[i]
-            if n_clusters <= 0:
-                continue
-
-            kmeans = KMeans(n_clusters=n_clusters, init='k-means++')
-            kmeans.fit(x.cpu())
-            centers = kmeans.cluster_centers_
-
-            for center in centers:
-                dist_map = np.linalg.norm(x.cpu() - center, axis=1)
-                dist_map[masked_id] = np.infty
-                idx = np.argmin(dist_map)
-                masked_id.append(idx)
-                indices.append(part_id[idx])
-        return torch.tensor(indices)
-
-
-class GraphPartitionEmbed(ActiveLearningAgent):
-    """
-    K-Means clustering over the embedding over each graph partition.
-
-    Feature Space: embedding
-    Partition: Yes
-    Avoid Known: No
-    """
-
-    def __init__(self, data, model, seed, args):
-        super(GraphPartitionEmbed, self).__init__(data, model, seed, args)
-
-    def query(self, b):
-
-        # Perform graph partition
-        self.num_parts = int(np.ceil(b / self.num_centers))
-        if self.num_parts > self.data.max_part:
-            self.num_parts = self.data.max_part
-            self.num_centers = 1
-        partitions = np.array(self.data.partitions[self.num_parts].cpu())
-
-        # Determine the number of partitions and number of centers
-        part_size = self.get_n_cluster(b, partitions)
-
-        # Get propagated nodes
-        x_embed = self.transform('embed')
-
-        # Perform K-Means as approximation
-        indices = list(np.where(self.data.train_mask != 0)[0])
-        for i in range(self.num_parts):
-            part_id = np.where(partitions == i)[0]
-            masked_id = [i for i, x in enumerate(part_id) if x in indices]
-            x = x_embed[part_id]
-
-            n_clusters = part_size[i]
-            if n_clusters <= 0:
-                continue
-
-            kmeans = KMeans(n_clusters=n_clusters, init='k-means++')
-            kmeans.fit(x.cpu())
-            centers = kmeans.cluster_centers_
-
-            for center in centers:
-                dist_map = np.linalg.norm(x.cpu() - center, axis=1)
-                dist_map[masked_id] = np.infty
-                idx = np.argmin(dist_map)
-                masked_id.append(idx)
-                indices.append(part_id[idx])
-        return torch.tensor(indices)
-
-
-class GraphPartitionProp(ActiveLearningAgent):
-    """
-    K-Means clustering over the embedding over each graph partition.
-
-    Feature Space: prop
-    Partition: Yes
-    Avoid Known: No
-    """
-
-    def __init__(self, data, model, seed, args):
-        super(GraphPartitionProp, self).__init__(data, model, seed, args)
-
-    def query(self, b):
-
-        # Perform graph partition
-        self.num_parts = int(np.ceil(b / self.num_centers))
-        if self.num_parts > self.data.max_part:
-            self.num_parts = self.data.max_part
-            self.num_centers = 1
-
-        partitions = np.array(self.data.partitions[self.num_parts].cpu())
-
-        # Get propagated nodes
-        x_embed = self.transform('prop')
-
-        part_size = self.get_n_cluster(b, partitions)
-
-        # Perform K-Means as approximation
-        indices = list(np.where(self.data.train_mask != 0)[0])
-        for i in range(self.num_parts):
-            part_id = np.where(partitions == i)[0]
-            masked_id = [i for i, x in enumerate(part_id) if x in indices]
-            x = x_embed[part_id]
-
-            n_clusters = part_size[i]
-            if n_clusters <= 0:
-                continue
-
-            kmeans = KMeans(n_clusters=n_clusters, init='k-means++')
-            kmeans.fit(x.cpu())
-            centers = kmeans.cluster_centers_
-
-            for center in centers:
-                dist_map = np.linalg.norm(x.cpu() - center, axis=1)
-                dist_map[masked_id] = np.infty
-                idx = np.argmin(dist_map)
-                masked_id.append(idx)
-                indices.append(part_id[idx])
-        return torch.tensor(indices)
-
-
-class FarFromKnown(ActiveLearningAgent):
-    """
-    K-Means clustering over the feature and avoid known nodes
-
-    Feature Space: x
-    Partition: No
-    Avoid Known: Yes
-    """
-
-    def __init__(self, data, model, seed, args):
-        super(FarFromKnown, self).__init__(data, model, seed, args)
-
-    def query(self, b):
-
-        # Get propagated nodes
-        x = self.transform('none').cpu()
-
-        # Perform K-Means as approximation
-        kmeans = KMeans(n_clusters=b, init='k-means++')
-        kmeans.fit(x)
-        centers = kmeans.cluster_centers_
-
-        indices = list(np.where(self.data.train_mask != 0)[0])
-        dist_to_center = np.ones(x.shape[0]) * np.infty
-
-        for idx in indices:
-            dist_to_center = np.minimum(dist_to_center, np.linalg.norm(x - x[idx], axis=1))
-
-        for center in centers:
-            dist_map = np.linalg.norm(x.cpu() - center, axis=1) - dist_to_center
-            dist_map[indices] = np.infty
-            idx = np.argmin(dist_map)
-            indices.append(idx)
-        return torch.tensor(indices)
-
-
-class FarEmbed(ActiveLearningAgent):
-    """
-    K-Means clustering over the embedding and avoid known nodes
-
-    Feature Space: embedding
-    Partition: No
-    Avoid Known: Yes
-    """
-
-    def __init__(self, data, model, seed, args):
-        super(FarEmbed, self).__init__(data, model, seed, args)
-
-    def query(self, b):
-
-        # Get propagated nodes
-        x = self.transform('embed').cpu()
-
-        # Perform K-Means as approximation
-        kmeans = KMeans(n_clusters=b, init='k-means++')
-        kmeans.fit(x)
-        centers = kmeans.cluster_centers_
-
-        indices = list(np.where(self.data.train_mask != 0)[0])
-        dist_to_center = np.ones(x.shape[0]) * np.infty
-
-        for idx in indices:
-            dist_to_center = np.minimum(dist_to_center, np.linalg.norm(x - x[idx], axis=1))
-
-        for center in centers:
-            dist_map = np.linalg.norm(x.cpu() - center, axis=1) - dist_to_center
-            dist_map[indices] = np.infty
-            idx = np.argmin(dist_map)
-            indices.append(idx)
-        return torch.tensor(indices)
-
-
-class FarProp(ActiveLearningAgent):
-    """
-    K-Means clustering over the propagated features and avoid known nodes
-
-    Feature Space: embedding
-    Partition: No
-    Avoid Known: Yes
-    """
-
-    def __init__(self, data, model, seed, args):
-        super(FarProp, self).__init__(data, model, seed, args)
-
-    def query(self, b):
-
-        # Get propagated nodes
-        x = self.transform('prop').cpu()
-
-        # Perform K-Means as approximation
-        kmeans = KMeans(n_clusters=b, init='k-means++')
-        kmeans.fit(x)
-        centers = kmeans.cluster_centers_
-
-        indices = list(np.where(self.data.train_mask != 0)[0])
-        dist_to_center = np.ones(x.shape[0]) * np.infty
-
-        for idx in indices:
-            dist_to_center = np.minimum(dist_to_center, np.linalg.norm(x - x[idx], axis=1))
-
-        for center in centers:
-            dist_map = np.linalg.norm(x.cpu() - center, axis=1) - dist_to_center
-            dist_map[indices] = np.infty
-            idx = np.argmin(dist_map)
-            indices.append(idx)
-        return torch.tensor(indices)
-
-
-class FarPartition(ActiveLearningAgent):
-    """
-    K-Means clustering over the feature on each partition and avoid known nodes
-
-    Feature Space: x
-    Partition: Yes
-    Avoid Known: Yes
-    """
-
-    def __init__(self, data, model, seed, args):
-        super(FarPartition, self).__init__(data, model, seed, args)
-
-    def query(self, b):
-
-        # Perform graph partition
-        self.num_parts = int(np.ceil(b / self.num_centers))
-        if self.num_parts > self.data.max_part:
-            self.num_parts = self.data.max_part
-            self.num_centers = 1
-        partitions = np.array(self.data.partitions[self.num_parts].cpu())
-
-        # Determine the number of partitions and number of centers
-        part_size = self.get_n_cluster(b, partitions)
-
-        x_embed = self.transform('none')
-        
-        N = x_embed.shape[0]
-        decay = 1
-
-        # Perform K-Means as approximation
-        indices = list(np.where(self.data.train_mask != 0)[0])
-        dist_to_center = np.ones(N) * np.infty
-        for idx in indices:
-            dist_to_center = np.minimum(
-                dist_to_center, np.linalg.norm(x_embed.cpu() - x_embed[idx].cpu(), axis=1)
-            )
-
-        for i in range(self.num_parts):
-            part_id = np.where(partitions == i)[0]
-            masked_id = [i for i, x in enumerate(part_id) if x in indices]
-            x = x_embed[part_id]
-            dist = dist_to_center[part_id]
-
-            n_clusters = part_size[i]
-            if n_clusters <= 0:
-                continue
-
-            kmeans = KMeans(n_clusters=n_clusters, init='k-means++')
-            kmeans.fit(x.cpu())
-            centers = kmeans.cluster_centers_
-
-            for center in centers:
-                dist_map = np.linalg.norm(x.cpu() - center, axis=1) - dist * decay
-                dist_map[masked_id] = np.infty
-                idx = np.argmin(dist_map)
-                masked_id.append(idx)
-                indices.append(part_id[idx])
-
+        # Get entropy
+        logits = self.clf(self.data.x, self.data.adj_t)
+        entropy = -torch.sum(F.softmax(logits, dim=1) * F.log_softmax(logits, dim=1), dim=1)
+
+        # Get centrality
+        page = torch.tensor(list(pagerank(self.data.g).values()),
+                            dtype=logits.dtype, device=self.args.device)
+
+        # Get density
+        x = self.get_node_representation('embedding').cpu()
+        N = x.shape[0]
+
+        kmeans = Cluster(n_clusters=b, n_dim=x.shape[1], seed=self.seed, device=self.args.device)
+        kmeans.train(x)
+        centers = kmeans.get_centroids()
+        label = kmeans.predict(x)
+
+        x = x.to(logits.device)
+        centers = torch.tensor(centers[label], dtype=x.dtype, device=x.device)
+        dist_map = torch.linalg.norm(x - centers, dim=1).to(logits.dtype)
+        density = 1 / (1 + dist_map)
+
+        # Get percentile
+        percentile = (torch.arange(N, dtype=logits.dtype, device=self.args.device) / N)
+        id_sorted = density.argsort(descending=False)
+        density[id_sorted] = percentile
+        id_sorted = entropy.argsort(descending=False)
+        entropy[id_sorted] = percentile
+        id_sorted = page.argsort(descending=False)
+        page[id_sorted] = percentile
+
+        # Get linear combination
+        alpha, beta, gamma = self.data.params['age']
+        age_score = alpha * entropy + beta * density + gamma * page
+        age_score[np.where(self.data.train_mask != 0)[0]] = 0
+        _, indices = torch.topk(age_score, k=b)
         return indices
 
 
-class FarPartitionEmbed(ActiveLearningAgent):
+class ClusterBased(ActiveLearning):
     """
-    K-Means clustering over the embedding on each partition and avoid known nodes
+    Cluster:
+    The cluster method first performs clustering (K-Means as approximation of K-Medoids)
+    on the aggregated node features and then choose the nodes closest to the K-means centers.
 
-    Feature Space: embedding
-    Partition: Yes
-    Avoid Known: Yes
+    rep {'feature', 'embedding', 'aggregation'}
+    init {‘k-means++’, ‘random’}
     """
 
-    def __init__(self, data, model, seed, args):
-        super(FarPartitionEmbed, self).__init__(data, model, seed, args)
+    def __init__(self, data, model, seed, args,
+                 representation='aggregation',
+                 encoder='gcn',
+                 initialization='k-means++'):
+        super(ClusterBased, self).__init__(data, model, seed, args)
+        self.representation = representation
+        self.encoder = encoder
+        self.initialization = None if initialization != 'k-means++' else initialization
 
     def query(self, b):
 
-        # Perform graph partition
+        # Get node representations
+        x = self.get_node_representation(self.representation, self.encoder)
+
+        # Perform K-Means clustering:
+        kmeans = Cluster(n_clusters=b, n_dim=x.shape[1], seed=self.seed, device=self.args.device)
+        kmeans.train(x.cpu().numpy())
+        centers = torch.tensor(kmeans.get_centroids(), dtype=x.dtype, device=x.device)
+
+        # Obtain the centers
+        indices = list(np.where(self.data.train_mask != 0)[0])
+        for center in centers:
+            center = center.to(dtype=x.dtype, device=x.device)
+            dist_map = torch.linalg.norm(x - center, dim=1)
+            dist_map[indices] = torch.tensor(np.infty, dtype=dist_map.dtype, device=dist_map.device)
+            idx = int(torch.argmin(dist_map))
+            indices.append(idx)
+
+        return torch.tensor(indices)
+
+
+class PartitionBased(ActiveLearning):
+    """
+    Partition:
+    Our method, which first partitions the graph into communities, and
+    performs clustering over each graph community on the aggregated node features.
+
+    rep {'none', 'embed', 'prop'}
+    init {‘k-means++’, ‘random’}
+    compensation {float: 0 - 1}
+    """
+
+    def __init__(self, data, model, seed, args,
+                 representation='aggregation',
+                 encoder='gcn',
+                 initialization='k-means++',
+                 compensation=1):
+        super(PartitionBased, self).__init__(data, model, seed, args)
+        self.representation = representation
+        self.encoder = encoder
+        self.initialization = None if initialization != 'k-means++' else initialization
+        self.compensation = compensation
+
+    def query(self, b):
+
+        # Perform graph partition (preprocessed)
         self.num_parts = int(np.ceil(b / self.num_centers))
+        compensation = 0
         if self.num_parts > self.data.max_part:
             self.num_parts = self.data.max_part
-            self.num_centers = 1
+            compensation = self.compensation
         partitions = np.array(self.data.partitions[self.num_parts].cpu())
+
+        # Get node representations
+        x = self.get_node_representation(self.representation, self.encoder)
 
         # Determine the number of partitions and number of centers
-        part_size = self.get_n_cluster(b, partitions)
+        part_size = self.split_cluster(b, partitions, x)
 
-        x_embed = self.transform('none')
-
-        N = x_embed.shape[0]
-        decay = 1
-
-        # Perform K-Means as approximation
+        # Iterate over each partition
         indices = list(np.where(self.data.train_mask != 0)[0])
-        dist_to_center = np.ones(N) * np.infty
-        for idx in indices:
-            dist_to_center = np.minimum(dist_to_center, np.linalg.norm(x_embed.cpu() - x_embed[idx].cpu(), axis=1))
-
         for i in range(self.num_parts):
             part_id = np.where(partitions == i)[0]
             masked_id = [i for i, x in enumerate(part_id) if x in indices]
-            x = x_embed[part_id]
-            dist = dist_to_center[part_id]
+            xi = x[part_id]
 
             n_clusters = part_size[i]
             if n_clusters <= 0:
                 continue
 
-            kmeans = KMeans(n_clusters=n_clusters, init='k-means++')
-            kmeans.fit(x.cpu())
-            centers = kmeans.cluster_centers_
+            # Perform K-Means clustering:
+            kmeans = Cluster(n_clusters=n_clusters, n_dim=xi.shape[1], seed=self.seed, device=self.args.device)
+            kmeans.train(xi.cpu().numpy())
+            centers = kmeans.get_centroids()
 
+            # Compensating for the interference across partitions
+            dist = None
+            if self.compensation > 0:
+                dist_to_center = torch.ones(x.shape[0], dtype=x.dtype, device=x.device) * np.infty
+                for idx in indices:
+                    dist_to_center = torch.minimum(dist_to_center, torch.linalg.norm(x - x[idx], dim=1))
+                dist = dist_to_center[part_id]
+
+            # Obtain the centers
             for center in centers:
-                dist_map = np.linalg.norm(x.cpu() - center, axis=1) - dist * decay
-                dist_map[masked_id] = np.infty
-                idx = np.argmin(dist_map)
+                center = torch.tensor(center, dtype=x.dtype, device=x.device)
+                dist_map = torch.linalg.norm(xi - center, dim=1)
+                if self.compensation > 0:
+                    dist_map -= dist * compensation
+                dist_map[masked_id] = torch.tensor(np.infty, dtype=dist_map.dtype, device=dist_map.device)
+                idx = int(torch.argmin(dist_map))
                 masked_id.append(idx)
                 indices.append(part_id[idx])
 
-        return indices
-
-
-class FarPartitionProp(ActiveLearningAgent):
-    """
-    K-Means clustering over the propagated embedding.
-
-    Feature Space: prop
-    Partition: Yes
-    Avoid Known: Yes
-    """
-
-    def __init__(self, data, model, seed, args):
-        super(FarPartitionProp, self).__init__(data, model, seed, args)
-
-    def query(self, b):
-
-        # Perform graph partition
-        self.num_parts = int(np.ceil(b / self.num_centers))
-        decay = 0
-        if self.num_parts > self.data.max_part:
-            self.num_parts = self.data.max_part
-            decay = 1
-
-        partitions = np.array(self.data.partitions[self.num_parts].cpu())
-
-        # Get propagated nodes
-        x_embed = self.transform('prop')
-        part_size = self.get_n_cluster(b, partitions)
-
-        # Perform K-Means as approximation
-        indices = list(np.where(self.data.train_mask != 0)[0])
-        for i in range(self.num_parts):
-            part_id = np.where(partitions == i)[0]
-            masked_id = [i for i, x in enumerate(part_id) if x in indices]
-            x = x_embed[part_id]
-
-            n_clusters = part_size[i]
-            if n_clusters <= 0:
-                continue
-
-            kmeans = KMeans(n_clusters=n_clusters, init='k-means++')
-            kmeans.fit(x.cpu())
-            centers = kmeans.cluster_centers_
-
-            for idx in indices:
-                dist_to_center = np.ones(x_embed.shape[0]) * np.infty
-                dist_to_center = np.minimum(dist_to_center, np.linalg.norm(x_embed.cpu() - x_embed[idx].cpu(), axis=1))
-            dist = dist_to_center[part_id]
-
-            for center in centers:
-                dist_map = np.linalg.norm(x.cpu() - center, axis=1)
-                dist_map -= dist * decay
-                dist_map[masked_id] = np.infty
-                idx = np.argmin(dist_map)
-                masked_id.append(idx)
-                indices.append(part_id[idx])
         return torch.tensor(indices)
