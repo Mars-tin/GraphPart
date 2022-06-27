@@ -1,8 +1,8 @@
-# GraphPart-Active-Learning-GNN 
+# GraphPart
 
-This repository provides a PyTorch implementation for the Graph-Partition-based active learning framework and mentioned baselines for GNNs as described in the following paper:
+This repository provides a PyTorch implementation for the Graph-Partition-based active learning framework and baselines for GNNs as described in the following paper:
 
-[Partition-Based Active Learning for Graph Neural Networks](#)
+[Partition-Based Active Learning for Graph Neural Networks](https://arxiv.org/abs/2201.09391)
 
 ## Requirements
 
