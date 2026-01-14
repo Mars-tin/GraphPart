@@ -14,7 +14,6 @@ def run(args):
 
     # Load dataset
     data = load_data(name=args.dataset,
-                     partition=args.partition,
                      read=True, save=False).to(args.device)
 
     for gnn in args.model:
@@ -168,8 +167,6 @@ if __name__ == '__main__':
         "--model", default=gnns)
     parser.add_argument(
         "--dataset", default='cora')
-    parser.add_argument(
-        "--partition", type=str, default='greedy')
 
     # Active Learning parameters
     parser.add_argument(
